@@ -1,0 +1,4 @@
+Pose2D pose = read_robot_pose();   // odometry / IMU fusion
+SensorStreams S = read_sensors();  // your drivers
+VelocityCmd cmd = BEARHUG_ControlStep(pose, S, ORIGIN_X, ORIGIN_Y, CELL_SIZE);
+send_to_motors(cmd.v, cmd.w);

@@ -1,0 +1,530 @@
+/**
+ * BEARHUG TinyML Core Algorithms
+ * 
+ * Minimal C++ implementation for small, low-power microcontrollers.
+ * Implements:
+ *  - PSI–A  Perception & Target Estimation with Blacklight sensors
+ *  - PSI–B  Global Geodesic Planner (A*-like on occupancy grid)
+ *  - PSI–C  Local Euclidean-Gradient Controller (v, ω)
+ *
+ * Replace stub sensor functions with your actual drivers.
+ */
+
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+// =========================================================
+// Basic Types
+// =========================================================
+
+struct Vec2 {
+    float x;
+    float y;
+};
+
+struct Pose2D {
+    Vec2  p;   // position
+    float th;  // heading (rad)
+};
+
+struct VelocityCmd {
+    float v;   // linear velocity
+    float w;   // angular velocity
+};
+
+// ---------------------------------------------------------
+// Occupancy / Belief grid (small fixed size for MCU)
+// ---------------------------------------------------------
+
+// Tune these for your microcontroller memory.
+#define GRID_W 32
+#define GRID_H 32
+
+// Occupancy: 0 = free, 1 = obstacle
+struct OccGrid {
+    uint8_t data[GRID_H][GRID_W];
+};
+
+// Belief over target location (normalized probability over tiles)
+struct BeliefGrid {
+    float p[GRID_H][GRID_W];
+};
+
+// A* node record
+struct NodeRecord {
+    int16_t x;
+    int16_t y;
+    float   g;  // cost so far
+    float   f;  // g + h
+    int16_t px; // parent x
+    int16_t py; // parent y
+    uint8_t inOpen;
+    uint8_t inClosed;
+};
+
+// Simple path representation
+#define MAX_PATH_LEN 64
+struct Path {
+    Vec2   pts[MAX_PATH_LEN];
+    int16_t len;
+    float   total_cost;
+};
+
+// =========================================================
+// Sensor Streams (stub interface for TinyML / hardware layer)
+// =========================================================
+
+// You will replace these with real sensor data structures.
+struct BlacklightDetection {
+    Vec2  center;     // centroid in world or grid coordinates
+    float intensity;  // spectral intensity
+    uint8_t valid;
+};
+
+struct RGBDFrame {
+    // placeholder: e.g. depth map, etc.
+};
+
+struct AudioFrame {
+    // placeholder
+};
+
+struct IMUFrame {
+    // placeholder
+};
+
+struct LidarScan {
+    // placeholder: e.g. ranges[]
+};
+
+struct SensorStreams {
+    BlacklightDetection blacklight;
+    RGBDFrame rgbd;
+    AudioFrame audio;
+    IMUFrame imu;
+    LidarScan lidar;
+};
+
+// =========================================================
+// Utility functions
+// =========================================================
+
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static inline float dist2(const Vec2 &a, const Vec2 &b) {
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    return sqrtf(dx*dx + dy*dy);
+}
+
+// Convert continuous position to grid indices
+static inline void worldToGrid(const Vec2 &p, int16_t &gx, int16_t &gy, 
+                               float origin_x, float origin_y, float cell_size) {
+    gx = (int16_t)((p.x - origin_x) / cell_size);
+    gy = (int16_t)((p.y - origin_y) / cell_size);
+}
+
+// Convert grid indices to continuous position (center of cell)
+static inline Vec2 gridToWorld(int16_t gx, int16_t gy,
+                               float origin_x, float origin_y, float cell_size) {
+    Vec2 p;
+    p.x = origin_x + (gx + 0.5f) * cell_size;
+    p.y = origin_y + (gy + 0.5f) * cell_size;
+    return p;
+}
+
+// =========================================================
+// PSI–A: Perception and Target Estimation with Blacklight
+// (Algorithm 1 in BEARHUG paper, adapted for MCU)
+// =========================================================
+
+struct PSI_A_State {
+    BeliefGrid belief;   // bt(z)
+    Vec2       last_z;   // z_{t-1}
+    uint8_t    has_last_z;
+    Vec2       offset_ok; // "ghost-like" role offset
+};
+
+// Initialize belief to uniform over free cells
+void PSI_A_Init(PSI_A_State &st, const OccGrid &occ) {
+    float total = 0.0f;
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            float val = (occ.data[y][x] == 0) ? 1.0f : 0.0f;
+            st.belief.p[y][x] = val;
+            total += val;
+        }
+    }
+    if (total > 0.0f) {
+        float inv = 1.0f / total;
+        for (int y = 0; y < GRID_H; ++y)
+            for (int x = 0; x < GRID_W; ++x)
+                st.belief.p[y][x] *= inv;
+    }
+    st.has_last_z = 0;
+    st.last_z.x   = 0.0f;
+    st.last_z.y   = 0.0f;
+    st.offset_ok.x = 0.0f;
+    st.offset_ok.y = 0.0f;
+}
+
+// Very lightweight "BeliefUpdate": 
+// re-weight cells near the detected blacklight centroid.
+static void BeliefUpdate_Blacklight(BeliefGrid &b, const BlacklightDetection &det,
+                                    float origin_x, float origin_y, float cell_size) {
+    if (!det.valid) {
+        // No detection: keep previous belief (could also diffuse or decay).
+        return;
+    }
+
+    // Simple Gaussian-like bump around detection
+    float sigma = 2.0f * cell_size;   // tune
+    float two_sigma2 = 2.0f * sigma * sigma;
+
+    float total = 0.0f;
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            Vec2 p = gridToWorld(x, y, origin_x, origin_y, cell_size);
+            float d = dist2(p, det.center);
+            float w = expf(-(d*d) / two_sigma2);
+            float newp = b.p[y][x] * w;
+            b.p[y][x] = newp;
+            total += newp;
+        }
+    }
+
+    if (total > 1e-6f) {
+        float inv = 1.0f / total;
+        for (int y = 0; y < GRID_H; ++y)
+            for (int x = 0; x < GRID_W; ++x)
+                b.p[y][x] *= inv;
+    }
+}
+
+// MAP estimate: tile with maximum probability
+static Vec2 BeliefMAP(const BeliefGrid &b,
+                      float origin_x, float origin_y, float cell_size) {
+    int16_t best_x = 0;
+    int16_t best_y = 0;
+    float best_p = -1.0f;
+
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            if (b.p[y][x] > best_p) {
+                best_p = b.p[y][x];
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+    return gridToWorld(best_x, best_y, origin_x, origin_y, cell_size);
+}
+
+// Main PSI–A step
+// Inputs: sensor streams, current state, map parameters
+// Output:
+//   z_hat_future  -> predicted target position ẑ_{t+ℓ}
+//   z_current     -> current MAP target position z_t
+void PSI_A_Step(const SensorStreams &S,
+                PSI_A_State &state,
+                float origin_x, float origin_y, float cell_size,
+                float lead_horizon,
+                Vec2 &z_hat_future,
+                Vec2 &z_current) {
+
+    // 1) Update belief using blacklight detection
+    BeliefUpdate_Blacklight(state.belief, S.blacklight,
+                            origin_x, origin_y, cell_size);
+
+    // 2) MAP estimate of current target position
+    z_current = BeliefMAP(state.belief, origin_x, origin_y, cell_size);
+
+    // 3) Discrete velocity estimate v̂_t
+    Vec2 vhat;
+    vhat.x = 0.0f;
+    vhat.y = 0.0f;
+    if (state.has_last_z) {
+        vhat.x = z_current.x - state.last_z.x;
+        vhat.y = z_current.y - state.last_z.y;
+    }
+
+    // 4) Predict lead-ahead position ẑ_{t+ℓ} = z_t + ℓ v̂_t + o_k
+    z_hat_future.x = z_current.x + lead_horizon * vhat.x + state.offset_ok.x;
+    z_hat_future.y = z_current.y + lead_horizon * vhat.y + state.offset_ok.y;
+
+    state.last_z     = z_current;
+    state.has_last_z = 1;
+}
+
+// =========================================================
+// PSI–B: Global Geodesic Planner (A* on occupancy grid)
+// (Algorithm 2 in BEARHUG paper, MCU-safe version)
+// =========================================================
+
+// Check if grid cell is inside map and free
+static inline uint8_t isFree(const OccGrid &occ, int16_t x, int16_t y) {
+    if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return 0;
+    return (occ.data[y][x] == 0);
+}
+
+// A* search with fixed-size node tables and linear min-search (no heap).
+// Returns 1 on success, 0 if no path.
+uint8_t PSI_B_Plan(const OccGrid &occ,
+                   const Vec2 &start_world,
+                   const Vec2 &goal_world,
+                   float origin_x, float origin_y, float cell_size,
+                   Path &out_path) {
+
+    NodeRecord nodes[GRID_H][GRID_W];
+
+    // Init nodes
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            nodes[y][x].x = x;
+            nodes[y][x].y = y;
+            nodes[y][x].g = 1e9f;
+            nodes[y][x].f = 1e9f;
+            nodes[y][x].px = -1;
+            nodes[y][x].py = -1;
+            nodes[y][x].inOpen = 0;
+            nodes[y][x].inClosed = 0;
+        }
+    }
+
+    int16_t sx, sy, gx, gy;
+    worldToGrid(start_world, sx, sy, origin_x, origin_y, cell_size);
+    worldToGrid(goal_world,  gx, gy, origin_x, origin_y, cell_size);
+
+    if (!isFree(occ, sx, sy) || !isFree(occ, gx, gy)) {
+        out_path.len = 0;
+        return 0;
+    }
+
+    // Initialize start
+    NodeRecord *start = &nodes[sy][sx];
+    start->g = 0.0f;
+    Vec2 goal_p = goal_world;
+    Vec2 start_p = start_world;
+    start->f = dist2(start_p, goal_p);
+    start->inOpen = 1;
+
+    // A* loop
+    uint8_t found = 0;
+    while (1) {
+        // Find open node with smallest f
+        NodeRecord *current = NULL;
+        float best_f = 1e9f;
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                if (nodes[y][x].inOpen && nodes[y][x].f < best_f) {
+                    best_f = nodes[y][x].f;
+                    current = &nodes[y][x];
+                }
+            }
+        }
+
+        if (current == NULL) {
+            // No path
+            break;
+        }
+
+        // If goal reached
+        if (current->x == gx && current->y == gy) {
+            found = 1;
+            break;
+        }
+
+        current->inOpen = 0;
+        current->inClosed = 1;
+
+        // 8-connected neighborhood
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+
+                int16_t nx = current->x + dx;
+                int16_t ny = current->y + dy;
+
+                if (!isFree(occ, nx, ny)) continue;
+
+                NodeRecord *nbr = &nodes[ny][nx];
+                if (nbr->inClosed) continue;
+
+                Vec2 cp = gridToWorld(current->x, current->y, origin_x, origin_y, cell_size);
+                Vec2 np = gridToWorld(nx, ny, origin_x, origin_y, cell_size);
+
+                float step_cost = dist2(cp, np);       // c(u->v) = ||u-v||
+                float new_g = current->g + step_cost;  // g_new
+
+                if (!nbr->inOpen || new_g < nbr->g) {
+                    nbr->g = new_g;
+                    // heuristic
+                    float h = dist2(np, goal_p);
+                    nbr->f = new_g + h;
+                    nbr->px = current->x;
+                    nbr->py = current->y;
+                    nbr->inOpen = 1;
+                }
+            }
+        }
+    }
+
+    if (!found) {
+        out_path.len = 0;
+        out_path.total_cost = 0.0f;
+        return 0;
+    }
+
+    // Reconstruct path from goal back to start
+    NodeRecord *cur = &nodes[gy][gx];
+    Vec2 tmp_pts[MAX_PATH_LEN];
+    int16_t count = 0;
+
+    while (cur && count < MAX_PATH_LEN) {
+        tmp_pts[count++] = gridToWorld(cur->x, cur->y, origin_x, origin_y, cell_size);
+        if (cur->px < 0 || cur->py < 0) break;
+        cur = &nodes[cur->py][cur->px];
+    }
+
+    // Reverse order
+    out_path.len = 0;
+    for (int16_t i = count - 1; i >= 0; --i) {
+        out_path.pts[out_path.len++] = tmp_pts[i];
+    }
+
+    out_path.total_cost = nodes[gy][gx].g;
+    return 1;
+}
+
+// Pick a waypoint ahead along the path, with lookahead distance delta
+Vec2 PSI_B_FirstWaypoint(const Path &path, const Vec2 &current_pos, float lookahead_delta) {
+    if (path.len == 0) {
+        return current_pos;
+    }
+
+    // Find segment where cumulative distance exceeds delta
+    float accum = 0.0f;
+    Vec2 prev = current_pos;
+
+    for (int i = 0; i < path.len; ++i) {
+        float d = dist2(prev, path.pts[i]);
+        if (accum + d >= lookahead_delta) {
+            return path.pts[i];
+        }
+        accum += d;
+        prev = path.pts[i];
+    }
+
+    // If path shorter than lookahead, return last point
+    return path.pts[path.len - 1];
+}
+
+// =========================================================
+// PSI–C: Local Euclidean-Gradient Controller
+// (Algorithm 3 in BEARHUG paper, MCU-safe version)
+// =========================================================
+
+struct PSI_C_Params {
+    float k_rho;   // kρ
+    float k_alpha; // kα
+    float k_beta;  // kβ
+    float v_max;
+    float w_max;
+};
+
+VelocityCmd PSI_C_Controller(const Pose2D &x,
+                             const Vec2 &w,
+                             const VelocityCmd &last_cmd,
+                             const PSI_C_Params &par) {
+    VelocityCmd cmd;
+
+    // ρ = ||p - w||
+    float dx = w.x - x.p.x;
+    float dy = w.y - x.p.y;
+    float rho = sqrtf(dx*dx + dy*dy);
+
+    // α = atan2(w_y - p_y, w_x - p_x) - θ
+    float alpha = atan2f(dy, dx) - x.th;
+
+    // Normalize alpha to [-pi, pi]
+    while (alpha >  M_PI) alpha -= 2.0f * M_PI;
+    while (alpha < -M_PI) alpha += 2.0f * M_PI;
+
+    // Control law (CLF-like)
+    cmd.v = par.k_rho * rho;
+    cmd.v = clampf(cmd.v, 0.0f, par.v_max);
+
+    float term = par.k_alpha * alpha + par.k_rho * par.k_beta * sinf(alpha);
+    cmd.w = clampf(term, -par.w_max, par.w_max);
+
+    // NOTE: If you want, you can add discrete micro-step soft-argmin
+    // tie-breaking here, but it is omitted to keep MCU code minimal.
+
+    return cmd;
+}
+
+// =========================================================
+// Example main control loop (pseudo-usage)
+// =========================================================
+
+// Global state
+OccGrid       g_occ;
+PSI_A_State   g_psiA;
+PSI_C_Params  g_psiC_params;
+Path          g_path;
+uint8_t       g_has_path = 0;
+
+// Call once at boot
+void BEARHUG_Init(float origin_x, float origin_y, float cell_size) {
+    // Initialize occupancy grid (0 = free, 1 = obstacle); here all free:
+    for (int y = 0; y < GRID_H; ++y)
+        for (int x = 0; x < GRID_W; ++x)
+            g_occ.data[y][x] = 0;
+
+    PSI_A_Init(g_psiA, g_occ);
+
+    // Controller gains (tune these!)
+    g_psiC_params.k_rho   = 1.0f;
+    g_psiC_params.k_alpha = 4.0f;
+    g_psiC_params.k_beta  = -0.5f;
+    g_psiC_params.v_max   = 0.5f;   // m/s
+    g_psiC_params.w_max   = 1.0f;   // rad/s
+
+    g_has_path = 0;
+}
+
+// This would be called at, say, 20–50 Hz
+VelocityCmd BEARHUG_ControlStep(const Pose2D &robot_pose,
+                                const SensorStreams &S,
+                                float origin_x, float origin_y, float cell_size) {
+
+    // 1) Perception & target prediction (PSI–A)
+    Vec2 z_hat_future, z_current;
+    float lead_horizon = 1.0f; // "ℓ" in time steps / scaling units
+    PSI_A_Step(S, g_psiA, origin_x, origin_y, cell_size,
+               lead_horizon, z_hat_future, z_current);
+
+    // 2) Replan global path if needed (PSI–B)
+    //    For MCU simplicity we replan every step; you can replan less often.
+    g_has_path = PSI_B_Plan(g_occ, robot_pose.p, z_hat_future,
+                            origin_x, origin_y, cell_size, g_path);
+
+    // 3) Local waypoint from path
+    Vec2 waypoint = z_hat_future;
+    if (g_has_path && g_path.len > 0) {
+        waypoint = PSI_B_FirstWaypoint(g_path, robot_pose.p, 0.3f); // 0.3 m lookahead
+    }
+
+    // 4) Local controller (PSI–C)
+    static VelocityCmd last_cmd = {0.0f, 0.0f};
+    VelocityCmd cmd = PSI_C_Controller(robot_pose, waypoint, last_cmd, g_psiC_params);
+    last_cmd = cmd;
+
+    // At this point, send cmd.v and cmd.w to your low-level motor controller.
+    return cmd;
+}
